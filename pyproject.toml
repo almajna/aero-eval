@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aero-eval"
+version = "0.1.0a1"
+description = "Adversarial evaluation harness for LLM-generated PyTorch models."
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Amr Almajnouni", email = "264993119+almajna@users.noreply.github.com" },
+]
+keywords = [
+    "pytorch",
+    "machine-learning",
+    "mlops",
+    "llm",
+    "evaluation",
+    "testing",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "torch>=2.4,<2.7",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+hf = [
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "accelerate>=0.30",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "build>=1.2",
+    "anthropic>=0.40",
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "accelerate>=0.30",
+]
+
+[project.urls]
+Homepage = "https://github.com/almajna/aero-eval"
+Repository = "https://github.com/almajna/aero-eval"
+Issues = "https://github.com/almajna/aero-eval/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aero_eval"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: requires CUDA GPU",
+    "fpr: false-positive regression suite (must pass before merge)",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+    "ignore::UserWarning",
+]
