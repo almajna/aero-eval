@@ -34,7 +34,11 @@ RESULTS_MD = HERE / "results.md"
 TIMEOUT_SECONDS = 30
 
 # The full failure taxonomy, ordered. Categories appear in this order in
-# tables and JSON output.
+# tables and JSON output. ``semantic_mismatch`` fires when the module runs
+# cleanly and produces correct shapes / no NaN / gradients flow, but the
+# numerical output disagrees with PyTorch's reference scaled_dot_product
+# attention (i.e. the LLM wrote *something* that compiles but isn't
+# attention).
 TAXONOMY = [
     "syntax",
     "import",
@@ -44,6 +48,7 @@ TAXONOMY = [
     "nan_inf",
     "backward_runtime",
     "dead_grads",
+    "semantic_mismatch",
     "pass",
 ]
 
@@ -54,15 +59,17 @@ TAXONOMY = [
 # --------------------------------------------------------------------------- #
 
 PROBE_SCRIPT = r"""
-import ast, json, sys, traceback
+import ast, json, sys
 from pathlib import Path
 
 src_path = Path(sys.argv[1])
 src = src_path.read_text(encoding="utf-8")
 
 
-def emit(cat):
-    print(json.dumps({"category": cat}))
+def emit(cat, **extra):
+    payload = {"category": cat}
+    payload.update(extra)
+    print(json.dumps(payload))
     sys.exit(0)
 
 
@@ -91,6 +98,7 @@ except Exception:
 
 # 4. Forward runtime.
 import torch
+import torch.nn.functional as F
 torch.manual_seed(0)
 q = torch.randn(2, 5, 64, requires_grad=True)
 k = torch.randn(2, 5, 64, requires_grad=True)
@@ -117,7 +125,7 @@ try:
 except Exception:
     emit("backward_runtime")
 
-# 8. Dead grads — at least one parameter must have a non-zero grad.
+# 8. Dead grads.
 any_grad = False
 for p in model.parameters():
     if p.grad is not None and p.grad.abs().sum().item() > 0:
@@ -126,12 +134,86 @@ for p in model.parameters():
 if not any_grad:
     emit("dead_grads")
 
+# 9. Semantic correctness — does the module's numerical output match
+#    PyTorch's reference scaled_dot_product_attention given the same Q/K/V
+#    projections? We test multiple input regimes (different seeds, with and
+#    without mask) so an implementation that works in one regime but breaks
+#    in another is still flagged.
+def _reference_attention(model, q, k, v, mask):
+    bsz, seq, _ = q.shape
+    H = model.n_heads
+    D = model.head_dim
+    qh = model.q_proj(q).view(bsz, seq, H, D).transpose(1, 2)
+    kh = model.k_proj(k).view(bsz, seq, H, D).transpose(1, 2)
+    vh = model.v_proj(v).view(bsz, seq, H, D).transpose(1, 2)
+    if mask is not None:
+        # mask: [bsz, seq, seq] -> broadcast over heads to [bsz, 1, seq, seq]
+        attn_mask = mask.unsqueeze(1)
+    else:
+        attn_mask = None
+    ref_h = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=attn_mask)
+    ref = ref_h.transpose(1, 2).contiguous().view(bsz, seq, H * D)
+    return model.out_proj(ref)
+
+
+# Build a fresh module for the semantic test (the one above has dirtied grads).
+torch.manual_seed(0)
+m2 = CustomAttention(d_model=64, n_heads=8)
+m2.eval()
+
+regimes = [
+    {"seed": 1, "use_mask": False, "label": "no_mask_seed1"},
+    {"seed": 2, "use_mask": True, "label": "full_mask_seed2"},
+    {"seed": 3, "use_mask": True, "label": "causal_mask_seed3", "causal": True},
+]
+
+mismatch_evidence = []
+for regime in regimes:
+    g = torch.Generator().manual_seed(regime["seed"])
+    qi = torch.randn(2, 5, 64, generator=g)
+    ki = torch.randn(2, 5, 64, generator=g)
+    vi = torch.randn(2, 5, 64, generator=g)
+
+    if regime["use_mask"]:
+        if regime.get("causal", False):
+            m_ = torch.tril(torch.ones(5, 5, dtype=torch.bool)).expand(2, 5, 5).contiguous()
+        else:
+            m_ = torch.ones(2, 5, 5, dtype=torch.bool)
+    else:
+        m_ = None
+
+    try:
+        with torch.no_grad():
+            llm_out = m2(qi, ki, vi, m_)
+            ref_out = _reference_attention(m2, qi, ki, vi, m_)
+    except Exception as e:
+        mismatch_evidence.append({
+            "regime": regime["label"],
+            "reason": "exception_during_semantic_eval",
+            "type": type(e).__name__,
+        })
+        continue
+
+    if not torch.allclose(llm_out, ref_out, atol=1e-4, rtol=1e-4):
+        max_abs = (llm_out - ref_out).abs().max().item()
+        mismatch_evidence.append({
+            "regime": regime["label"],
+            "max_abs_diff": max_abs,
+        })
+
+if mismatch_evidence:
+    emit("semantic_mismatch", regimes=mismatch_evidence)
+
 emit("pass")
 """
 
 
-def evaluate_sample(py_path: Path) -> str:
-    """Run the probe on one sample. Returns the failure category."""
+def evaluate_sample(py_path: Path) -> tuple[str, dict]:
+    """Run the probe on one sample.
+
+    Returns ``(category, extra)`` where ``extra`` is any structured data the
+    probe attached (e.g. mismatch regime details for semantic failures).
+    """
     try:
         result = subprocess.run(
             [sys.executable, "-c", PROBE_SCRIPT, str(py_path)],
@@ -141,11 +223,10 @@ def evaluate_sample(py_path: Path) -> str:
         )
     except subprocess.TimeoutExpired:
         # An infinite loop in the model's code counts as forward_runtime
-        # (it never returned a tensor). Categorize separately if you want
-        # to surface this; for now bucket with forward_runtime.
-        return "forward_runtime"
+        # (it never returned a tensor).
+        return "forward_runtime", {}
     except Exception:
-        return "forward_runtime"
+        return "forward_runtime", {}
 
     # Parse the last JSON line from stdout. Anything else means the probe
     # itself crashed — treat as forward_runtime.
@@ -154,12 +235,12 @@ def evaluate_sample(py_path: Path) -> str:
         if line.startswith("{") and line.endswith("}"):
             try:
                 payload = json.loads(line)
-                cat = payload.get("category", "forward_runtime")
-                if cat in TAXONOMY:
-                    return cat
             except json.JSONDecodeError:
                 continue
-    return "forward_runtime"
+            cat = payload.pop("category", "forward_runtime")
+            if cat in TAXONOMY:
+                return cat, payload
+    return "forward_runtime", {}
 
 
 # --------------------------------------------------------------------------- #
@@ -175,11 +256,14 @@ def evaluate_model(model: str) -> dict:
 
     paths = sorted(model_dir.glob("*.py"))
     failure_counts = dict.fromkeys(TAXONOMY, 0)
+    semantic_evidence: list[dict] = []
 
     print(f"=== {model} ({len(paths)} samples) ===", flush=True)
     for i, py_path in enumerate(paths, 1):
-        cat = evaluate_sample(py_path)
+        cat, extra = evaluate_sample(py_path)
         failure_counts[cat] += 1
+        if cat == "semantic_mismatch" and extra:
+            semantic_evidence.append({"sample": py_path.name, **extra})
         if i % 10 == 0 or i == len(paths):
             print(f"  {i}/{len(paths)}", flush=True)
 
@@ -190,6 +274,7 @@ def evaluate_model(model: str) -> dict:
         "n_pass": n_pass,
         "failure_distribution": failure_counts,
         "pass_rate": n_pass / n_total if n_total else 0.0,
+        "semantic_mismatch_evidence": semantic_evidence,
     }
 
 
@@ -203,11 +288,25 @@ def render_markdown(results: dict) -> str:
     lines.append("")
     lines.append("## Pass rate by model")
     lines.append("")
-    lines.append("| Model | n | Pass | Pass rate |")
-    lines.append("|-------|---|------|-----------|")
+    lines.append("Two pass rates are reported per model. **Naive pass** is the")
+    lines.append("rate that survives the syntactic + runtime + shape + grad checks")
+    lines.append("(everything before semantic correctness). **Semantic pass** is the")
+    lines.append("rate that *also* matches PyTorch's `scaled_dot_product_attention`")
+    lines.append("on multiple input regimes within `atol=rtol=1e-4`.")
+    lines.append("")
+    lines.append("| Model | n | Naive pass | Semantic pass | Naive→semantic gap |")
+    lines.append("|-------|---|------------|---------------|--------------------|")
     for model, data in results["per_model"].items():
+        n = data["n_total"]
+        n_pass = data["n_pass"]  # full pass — includes semantic
+        n_semantic_fail = data["failure_distribution"].get("semantic_mismatch", 0)
+        n_naive_pass = n_pass + n_semantic_fail
+        naive_rate = n_naive_pass / n if n else 0.0
+        semantic_rate = n_pass / n if n else 0.0
+        gap = naive_rate - semantic_rate
         lines.append(
-            f"| `{model}` | {data['n_total']} | {data['n_pass']} | {data['pass_rate']:.1%} |"
+            f"| `{model}` | {n} | {n_naive_pass} ({naive_rate:.1%}) | "
+            f"{n_pass} ({semantic_rate:.1%}) | {gap:.1%} |"
         )
     lines.append("")
     lines.append("## Failure distribution")
@@ -270,10 +369,17 @@ def main() -> int:
     print(f"\nWrote {RESULTS_JSON}")
     print(f"Wrote {RESULTS_MD}")
 
-    # Echo the pass-rate summary at the bottom.
+    # Echo the pass-rate summary.
     print("\n=== summary ===")
     for model, data in per_model.items():
-        print(f"  {model}: {data['n_pass']}/{data['n_total']} = {data['pass_rate']:.1%}")
+        n = data["n_total"]
+        n_pass = data["n_pass"]
+        n_semantic_fail = data["failure_distribution"].get("semantic_mismatch", 0)
+        n_naive = n_pass + n_semantic_fail
+        print(
+            f"  {model}: naive={n_naive}/{n} ({n_naive / n:.1%}) "
+            f"semantic={n_pass}/{n} ({n_pass / n:.1%})"
+        )
 
     return 0
 
