@@ -73,10 +73,10 @@ lightning_logs/
 checkpoints/
 runs/
 
-# Baseline study artifacts (regenerate locally)
-studies/baseline/raw/
-studies/baseline/results.json
-studies/baseline/results.md
+# Study artifacts — regenerate locally, never commit raw model outputs
+studies/*/raw/
+studies/*/results.json
+studies/*/results.md
 
 # Jupyter
 .ipynb_checkpoints/

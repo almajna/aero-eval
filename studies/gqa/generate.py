@@ -1,20 +1,12 @@
-"""Generate N attention implementations from each Anthropic model.
+"""Generate N grouped-query attention implementations from each Anthropic model.
 
-Reads ``prompts/attention_task.md``, sends it to each model ``--n-per-model``
-times, saves raw responses to ``raw/{model}/{idx:03d}.txt`` and the assembled
-runnable Python module to ``raw/{model}/{idx:03d}.py``.
-
-Resumable: skips an index if its ``.py`` file already exists. Re-running
-after a partial crash just fills in the gaps.
-
-Concurrency drops to 3 for Opus to stay under the 30k input-tokens-per-minute
-default rate limit. Haiku and Sonnet have higher limits and run at 10.
+Concurrency drops to 3 for Opus to stay under default rate limits.
 
 Usage::
 
-    python studies/baseline/generate.py --n-per-model 100
+    python studies/gqa/generate.py --n-per-model 100
 
-Requires ``ANTHROPIC_API_KEY`` in the environment. The key is never logged.
+Requires ``ANTHROPIC_API_KEY``.
 """
 
 from __future__ import annotations
@@ -46,17 +38,13 @@ DEFAULT_MODELS = [
 ]
 
 HERE = Path(__file__).parent
-PROMPT_PATH = HERE / "prompts" / "attention_task.md"
+PROMPT_PATH = HERE / "prompts" / "gqa_task.md"
 RAW_DIR = HERE / "raw"
 
-# Per-model concurrency cap. Opus has a tighter default rate limit (30k
-# input tokens/minute on most accounts), and our prompt is ~600 tokens —
-# 10 concurrent requests would burst to ~360k tokens/min and trip 429s.
 PER_MODEL_CONCURRENCY: dict[str, int] = {
     "claude-opus-4-7": 3,
 }
 DEFAULT_CONCURRENCY = 10
-
 MAX_TOKENS = 2048
 
 CLASS_HEADER = """\
@@ -66,17 +54,21 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-class CustomAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
+        if n_heads % n_kv_heads != 0:
+            raise ValueError("n_heads must be divisible by n_kv_heads")
         self.d_model = d_model
         self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.n_rep = n_heads // n_kv_heads
         self.head_dim = d_model // n_heads
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
+        self.q_proj = nn.Linear(d_model, n_heads * self.head_dim)
+        self.k_proj = nn.Linear(d_model, n_kv_heads * self.head_dim)
+        self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim)
         self.out_proj = nn.Linear(d_model, d_model)
 
     def forward(
@@ -90,13 +82,7 @@ class CustomAttention(nn.Module):
 
 
 def assemble_module(forward_body: str) -> str:
-    """Backward-compatible wrapper: same signature as the old single-arg API."""
     return _assemble(CLASS_HEADER, forward_body)
-
-
-# --------------------------------------------------------------------------- #
-# Generation.
-# --------------------------------------------------------------------------- #
 
 
 async def _generate_one(
